@@ -13,9 +13,17 @@
 
 `vascularmd` turns **vascular centerlines** (points `(x, y, z, r)` + directed
 connectivity) into **high-quality structured hexahedral meshes** of the vessel
-lumen, ready for CFD (and, via the two Stage 2 plans, FSI). It is the reference
-implementation for Decroocq et al., *"Modeling and hexahedral meshing of cerebral
-arterial networks from centerlines"* (Medical Image Analysis, 2023).
+lumen, ready for CFD (and, via the two Stage 2 plans, FSI). It is backed by two
+publications:
+
+- **Modeling & meshing engine** — Decroocq et al., *"Modeling and hexahedral
+  meshing of cerebral arterial networks from centerlines"* (Medical Image
+  Analysis, 2023). The parametric spline/bifurcation model and O-grid hexahedral
+  mesher (`ArterialTree`, `Nfurcation`, `Spline`, `Model`).
+- **Interactive software** — Decroocq et al., *"A Software to Visualize, Edit,
+  Model and Mesh Vascular Networks"* (IEEE EMBC 2022). The GUI (`Editor`) that
+  wraps the engine, letting non-expert users (e.g. clinicians) correct centerlines
+  against medical images and mesh them without programming.
 
 ### What it can currently do
 
@@ -29,7 +37,9 @@ arterial networks from centerlines"* (Medical Image Analysis, 2023).
 | Mesh quality check (scaled Jacobian) | `ArterialTree.check_mesh()` |
 | Post-processing: **flow extensions**, **inlet/outlet capping**, **virtual stenosis** from templates, deform-to-target | `add_extensions`, `close_surface`, `deform_surface_to_template`, `deform_surface_to_mesh` |
 | Export: **VTK** (surface `.vtk`, volume `.vtk`/`.vtu`), **OpenFOAM** polyMesh + boundary conditions, **Nastran `.nas`** (via meshio/pyvista) | `write_surface_mesh`, `write_volume_mesh`, `Simulation`, `pv.save_meshio` |
-| Interactive **GUI** for editing (move points, add/remove branches, change angle, add pathology, mesh, check) | `Editor` class |
+| **Tagged Nastran `.nas` for COMSOL FSI** — 2 cell domains (fluid / wall) + 5 boundary selections (interface, inlet, outlet, outer wall, wall-ends), emitted natively at write time | `notebooks/generate_nas_mesh.ipynb` |
+| Interactive **GUI** for editing (move points, add/remove branches, change angle, add pathology, mesh, check) across four representation modes | `Editor` class |
+| **Medical-image overlay** — confront the network against a NIFTI image (local 2D slices, ray-traced along the current viewpoint) to correct centerlines to the real anatomy | `Editor.load_image / compute_slice` |
 | Preprocessing from image segmentation to directed centerlines | `Others/segmentation_to_centerlines.py` |
 
 ### Known limitations (from README + code)
@@ -37,12 +47,15 @@ arterial networks from centerlines"* (Medical Image Analysis, 2023).
 - Input centerlines must be **directed** in the flow direction.
 - No complex/non-planar multifurcations (coplanar n-furcations only).
 - Meshing can fail on hard geometry; failures are fixed by hand-editing input in the GUI.
-- The volume mesh fills the **lumen only** (single fluid domain). There is no vessel
-  wall layer in the hex mesh — this is exactly the gap that
-  [`plan_for_extending_volume_mesh.md`](plan_for_extending_volume_mesh.md) addresses.
-- The `.nas` export is **untagged**: every hexahedron is written with the same
-  (default) property, so downstream tools (COMSOL) cannot select a sub-region or a
-  boundary. This is the gap that [`plan_for_nas_tagging.md`](plan_for_nas_tagging.md) addresses.
+- The `mesh_volume` mesher fills the **lumen only** (single fluid domain); it grows no
+  dedicated vessel-wall band. For FSI, [`notebooks/generate_nas_mesh.ipynb`](notebooks/generate_nas_mesh.ipynb)
+  works around this by **reinterpreting the outermost O-grid layer `a` as the solid wall**
+  (fluid = `b`+`c`), yielding a two-domain mesh with no extra cells; a real wall band of
+  controllable thickness remains the fidelity upgrade in
+  [`plan_for_extending_volume_mesh.md`](plan_for_extending_volume_mesh.md).
+- The library's built-in `.nas` writers are **untagged** (one implicit domain). Tagging is
+  now done at generation time by [`notebooks/generate_nas_mesh.ipynb`](notebooks/generate_nas_mesh.ipynb)
+  (see §2.10), following [`plan_for_nas_boundary_tagging.md`](plan_for_nas_boundary_tagging.md).
 
 ### The four-graph data model (central design idea)
 
@@ -63,6 +76,13 @@ The surface and volume meshes themselves are stored on the `ArterialTree` as fla
 arrays (`_surface_mesh`, `_volume_mesh`) plus an optional **`link_graph`** that maps each
 face/cell back to `[edge_start, edge_end, cross_section_index]` — the natural substrate for
 tagging (see the NAS tagging plan).
+
+These back-end graphs surface directly in the GUI as its **four representation modes**
+(*data → topology → model → mesh*, per the EMBC 2022 paper): the user edits at whichever
+stage is most convenient — dragging raw data points, trimming branches or rotating angles
+in topology mode, moving spline control points / adjusting smoothing in model mode, or
+checking cell quality in mesh mode — and each mode can be overlaid on the medical image
+and on the other modes simultaneously.
 
 ### End-to-end pipeline
 
@@ -330,8 +350,16 @@ The linear-algebra engine behind `Spline.approximation`.
 
 ### 2.7 `Editor.py` — vpython GUI
 
-A large interactive editor. It holds an `ArterialTree` and mirrors every capability as
-buttons/sliders; only the meshing-relevant methods are highlighted here.
+A large interactive editor — the subject of the EMBC 2022 software paper. Built on the
+`vpython` package (chosen over Blender/Paraview for interaction-oriented simplicity), it
+holds an `ArterialTree` and mirrors every capability as buttons/sliders. The layout is a
+3D viewer + message bar + edit menu + import/export field + four independently toggled
+representation panes (data / topology / model / mesh). Editing is guided by an optional
+medical-image overlay so the network can be matched to the true patient anatomy at every
+step. Typical use cases from the paper: repairing noisy open-database centerlines (e.g.
+BraVa) into CFD-valid meshes, and rapidly generating mesh databases by varying branch
+angle or topology from a single input network. Only the meshing-relevant methods are
+highlighted here.
 
 - `__init__(tree, width, height)` — Build the whole vpython scene, sliders and widgets.
 - `reset_scene / do_nothing / node_color / barycenter_finder` — Scene helpers.
@@ -373,6 +401,46 @@ Standalone tools to get **directed** centerlines from images/skeletons/third-par
 
 ---
 
+### 2.10 `notebooks/generate_nas_mesh.ipynb` — native tagged Nastran (`.nas`) export for COMSOL FSI
+
+Implements [`plan_for_nas_boundary_tagging.md`](plan_for_nas_boundary_tagging.md) end-to-end:
+it emits, **at write time and with only native `ArterialTree` functions**, the domain and
+boundary property-ids (PIDs) a COMSOL fluid–structure-interaction model needs — so the setup
+is scriptable via LiveLink with **zero manual face-picking**. Under the proof-of-concept
+paradigm the existing O-grid **layer `a`** (outermost band) is reinterpreted as the **solid
+wall** and parts `b`+`c` as the **fluid**, giving a full two-domain FSI mesh from today's
+lumen-only mesher with no extra cells. It builds the mesh once (`model_network` →
+`compute_cross_sections` → `mesh_volume`) then writes three files of increasing richness:
+
+- **One-domain** — every `CHEXA` gets PID 1 via `mesh.cell_data["nastran:ref"]` (meshio's
+  Nastran writer emits it into the element PID field; no `pv.save_meshio` hop needed).
+- **Two-domain** — per-cell fluid/wall split. A faithful mirror of `ogrid_pattern_faces`
+  (`ogrid_faces_with_region`, asserted equal to the library's own faces) flags each O-grid
+  quad's radial band (`is_layer_a`, `k ≤ num_a`); tiled across every slab (validated against
+  `get_volume_link()` and by centroid radius) it gives PID 2 = wall (layer a), PID 1 = fluid.
+- **Full FSI** — the two `CHEXA` domains **plus five `CQUAD4` boundary selections**, each a
+  *coincident shell* that reuses the hex faces' corner node IDs and carries its own PID:
+
+  | PID | Group | Native derivation |
+  |---|---|---|
+  | 101 | fluid↔wall interface (a\|b) | faces shared by the two domains — split the mesh per PID (`threshold`), `extract_surface` each, intersect. Interior → FSI coupling |
+  | 111 | inlet fluid cap | inlet terminal's O-grid disk (`ogrid_pattern_faces` + node `id`), fluid quads only (`~is_layer_a`) → velocity BC |
+  | 131 | outlet fluid cap(s) | same at each outlet terminal → pressure BC |
+  | 201 | outer wall surface | all boundary faces **minus** every terminal cap (= layer-a outer surface, the lumen surface) → free / external pressure |
+  | 221 | wall-end annulus rings | the wall (`is_layer_a`) quads of the terminal disks → Fixed Constraint (removes rigid-body motion) |
+
+  Terminals are identified by the same criterion as `get_inlet_outlet()` (inlet = `end` node
+  with in-degree 0). Every cap is reconstructed **exactly** from `ogrid_pattern_faces` offset
+  by the section's base vertex id (`crsec_graph.nodes[n]['id']`) — the same bookkeeping
+  `mesh_volume` uses — so no geometric tolerance is involved. Each cell self-verifies:
+  boundary faces partition exactly into `{outer ∪ caps}`, the interface is disjoint from the
+  boundary, per-PID counts match the file, tags survive a meshio round-trip, and cap radii
+  order correctly (fluid inside annulus). meshio shares one global element-ID sequence across
+  the `CHEXA` and `CQUAD4` blocks, so EIDs never collide. On import COMSOL turns each PID into
+  a named domain/boundary selection (**with "Allow partitioning of shells" off**).
+
+---
+
 ## 3. Context relevant to the Stage 2 plans
 
 Discovered while reading the repository (grounds the two plans in the user's real workflow):
@@ -381,10 +449,11 @@ Discovered while reading the repository (grounds the two plans in the user's rea
   bifurcation as an **inner/outer SWC pair** (`bifurcation_X.swc` = lumen,
   `bifurcation_X_outer.swc` = wall) that share identical `(x,y,z)` topology and differ only
   in radius; the wall thickness is a uniform **0.5** (e.g. r 0.62 → 1.12).
-- **`.nas` export already works** but is **untagged.** `notebooks/vtk_to_nas.ipynb` builds a
-  bifurcation volume mesh and calls `pv.save_meshio(nas_path, volume_mesh)`; the resulting
-  `Output/bifurcation_116_volume_mesh.nas` (meshio v4.4.6) contains **93 764 `GRID*` +
-  89 232 `CHEXA`** cards and **no property/component IDs** — a single implicit domain.
+- **`.nas` export already works** but *was* **untagged** at the time the plans were written:
+  `notebooks/vtk_to_nas.ipynb` called `pv.save_meshio(nas_path, volume_mesh)`, producing a
+  single implicit domain with **no property/component IDs**. This is the gap now closed by
+  [`notebooks/generate_nas_mesh.ipynb`](notebooks/generate_nas_mesh.ipynb) (§2.10), which tags
+  domains and boundaries at write time.
 - **The wall is currently produced as two separate surfaces**, not as hex cells.
   `notebooks/bifurcations_to_stl.ipynb` models inner and outer separately, deforms the inner
   onto the outer via `deform_surface_to_mesh`, caps both with `close_surface`, and relies on
